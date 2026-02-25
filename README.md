@@ -40,4 +40,3 @@ Requirements:
    ```bash
    bun run dev
    ```
-4. Navigate to the local URL (typically `http://localhost:5173`) and enjoy!
