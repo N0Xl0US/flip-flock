@@ -11,7 +11,7 @@ A highly optimized 2D boids simulation utilizing WebGPU compute shaders. Capable
 This project simulates complex murmuration and flocking behaviors (cohesion, alignment, and separation) utilizing a custom $O(n)$ spatial hashing pipeline on the GPU. By bypassing traditional CPU constraints, the simulation renders staggering numbers of entities with beautiful organic clustering physics.
 
 ### Features
-- **Massive Scale**: Simulates up to 500,000 boids at high framerates using highly parallel WebGPU compute shaders.
+- **Massive Scale**: Simulates up to 50000 boids at high framerates using highly parallel WebGPU compute shaders.
 - **Toroidal Space**: Boids flow through an infinite wrap-around coordinate system, allowing clusters to form naturally without edge-bumping artifacts.
 - **Spatial Hashing**: Utilizes counting sort and atomic operations (`countCells.wgsl`, `scatter.wgsl`) to bin entities into grid cells natively on the GPU, dropping neighbor collision checks from $O(n^2)$ to nearly $O(n)$.
 - **Dynamic Aesthetic Control**: A built-in user interface (`lil-gui`) gives immediate, sliding control over visual range, velocity limits, and flocking rule weights.
