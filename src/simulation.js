@@ -2,6 +2,8 @@ import countCellsWGSL from './shaders/countCells.wgsl?raw';
 import scatterWGSL from './shaders/scatter.wgsl?raw';
 import updateBoidsWGSL from './shaders/updateBoids.wgsl?raw';
 import spriteWGSL from './shaders/sprite.wgsl?raw';
+import prefixSumWGSL from './shaders/prefixSum.wgsl?raw';
+import clearBufferWGSL from './shaders/clearBuffer.wgsl?raw';
 
 export class Simulation {
     constructor() {
@@ -13,7 +15,7 @@ export class Simulation {
         this._fps = 0;
         this.onFpsUpdate = null;
         this.NUM_BOIDS = 25000;
-        this.MAX_BOIDS = 500000;
+        this.MAX_BOIDS = 50000;
         this.WORKGROUP_SIZE = 256;
 
         this.simParams = {
@@ -59,6 +61,7 @@ export class Simulation {
         this._setupGrid();
         this._createBuffers();
         this._createPipelines();
+        this._createBindGroups();
     }
 
     _resizeCanvas() {
@@ -107,23 +110,20 @@ export class Simulation {
 
         this.cellCountsBuf = this.device.createBuffer({
             size: this.numCells * 4,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         this.cellOffsetsBuf = this.device.createBuffer({
             size: this.numCells * 4,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        this.cellCountsReadBuf = this.device.createBuffer({
-            size: this.numCells * 4,
-            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
         this.sortedIndicesBuf = this.device.createBuffer({
             size: N * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
+        // Scatter uses atomic offsets — separate buffer that starts as a copy of cellOffsets
         this.scatterOffsetsBuf = this.device.createBuffer({
             size: this.numCells * 4,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
 
         this.gridParamsBuf = this.device.createBuffer({
@@ -136,7 +136,20 @@ export class Simulation {
             size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        this._zeroCounts = new Uint32Array(this.numCells);
+        // Prefix sum params buffer
+        this.prefixSumParamsBuf = this.device.createBuffer({
+            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Clear params buffer
+        this.clearParamsBuf = this.device.createBuffer({
+            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Pre-allocate reusable typed arrays for uniform writes
+        this._gridParamsAB = new ArrayBuffer(16);
+        this._simParamsAB = new ArrayBuffer(64);
+        this._renderParamsF32 = new Float32Array(4);
     }
 
     _createPipelines() {
@@ -148,6 +161,8 @@ export class Simulation {
         this.countCellsPL = cs(countCellsWGSL);
         this.scatterPL = cs(scatterWGSL);
         this.updateBoidsPL = cs(updateBoidsWGSL);
+        this.prefixSumPL = cs(prefixSumWGSL);
+        this.clearBufferPL = cs(clearBufferWGSL);
 
         const spriteModule = this.device.createShaderModule({ code: spriteWGSL });
         this.renderPL = this.device.createRenderPipeline({
@@ -174,118 +189,51 @@ export class Simulation {
         });
     }
 
-    updateParams(params) {
-        Object.assign(this.simParams, params);
-    }
+    _createBindGroups() {
+        // Clear cell counts bind group
+        this.clearCellCountsBG = this.device.createBindGroup({
+            layout: this.clearBufferPL.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.cellCountsBuf } },
+                { binding: 1, resource: { buffer: this.clearParamsBuf } },
+            ],
+        });
 
-    resize() {
-        this._resizeCanvas();
-        const old = this.numCells;
-        this._setupGrid();
-        if (this.numCells !== old) {
-            this.cellCountsBuf.destroy();
-            this.cellOffsetsBuf.destroy();
-            this.cellCountsReadBuf.destroy();
-            this.scatterOffsetsBuf.destroy();
-            this.cellCountsBuf = this.device.createBuffer({
-                size: this.numCells * 4,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-            });
-            this.cellOffsetsBuf = this.device.createBuffer({
-                size: this.numCells * 4,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            });
-            this.cellCountsReadBuf = this.device.createBuffer({
-                size: this.numCells * 4,
-                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-            });
-            this.scatterOffsetsBuf = this.device.createBuffer({
-                size: this.numCells * 4,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-            });
-            this._zeroCounts = new Uint32Array(this.numCells);
-        }
-    }
+        // Count cells bind groups (one per ping-pong source)
+        this.countCellsBGs = [0, 1].map(src => this.device.createBindGroup({
+            layout: this.countCellsPL.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.gridParamsBuf } },
+                { binding: 1, resource: { buffer: this.posBuffers[src] } },
+                { binding: 2, resource: { buffer: this.cellCountsBuf } },
+            ],
+        }));
 
-    async frame(timestamp) {
-        this._frameCount++;
-        if (timestamp - this._lastTime >= 1000) {
-            this._fps = this._frameCount;
-            this._frameCount = 0;
-            this._lastTime = timestamp;
-            if (this.onFpsUpdate) this.onFpsUpdate(this._fps);
-        }
+        // GPU prefix sum bind group
+        this.prefixSumBG = this.device.createBindGroup({
+            layout: this.prefixSumPL.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.prefixSumParamsBuf } },
+                { binding: 1, resource: { buffer: this.cellCountsBuf } },
+                { binding: 2, resource: { buffer: this.cellOffsetsBuf } },
+            ],
+        });
 
-        const src = this.t % 2;
-        const dst = (this.t + 1) % 2;
-        const boidWg = Math.ceil(this.NUM_BOIDS / this.WORKGROUP_SIZE);
+        // Scatter bind groups (one per ping-pong source)
+        this.scatterBGs = [0, 1].map(src => this.device.createBindGroup({
+            layout: this.scatterPL.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.gridParamsBuf } },
+                { binding: 1, resource: { buffer: this.posBuffers[src] } },
+                { binding: 2, resource: { buffer: this.scatterOffsetsBuf } },
+                { binding: 3, resource: { buffer: this.sortedIndicesBuf } },
+            ],
+        }));
 
-        this._writeUniforms();
-
-        // Clear cell counts
-        this.device.queue.writeBuffer(this.cellCountsBuf, 0, this._zeroCounts);
-
-        // 1. Count boids per cell
-        const enc1 = this.device.createCommandEncoder();
-        {
-            const bg = this.device.createBindGroup({
-                layout: this.countCellsPL.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: this.gridParamsBuf } },
-                    { binding: 1, resource: { buffer: this.posBuffers[src] } },
-                    { binding: 2, resource: { buffer: this.cellCountsBuf } },
-                ],
-            });
-            const pass = enc1.beginComputePass();
-            pass.setPipeline(this.countCellsPL);
-            pass.setBindGroup(0, bg);
-            pass.dispatchWorkgroups(boidWg);
-            pass.end();
-        }
-        enc1.copyBufferToBuffer(this.cellCountsBuf, 0, this.cellCountsReadBuf, 0, this.numCells * 4);
-        this.device.queue.submit([enc1.finish()]);
-
-        // 2. CPU prefix sum (grid is tiny: ~1500 cells = instant)
-        await this.cellCountsReadBuf.mapAsync(GPUMapMode.READ);
-        const rawCounts = new Uint32Array(this.cellCountsReadBuf.getMappedRange());
-        const counts = rawCounts.slice();
-        this.cellCountsReadBuf.unmap();
-
-        const offsets = new Uint32Array(this.numCells);
-        let sum = 0;
-        for (let i = 0; i < this.numCells; i++) {
-            offsets[i] = sum;
-            sum += counts[i];
-        }
-
-        this.device.queue.writeBuffer(this.cellOffsetsBuf, 0, offsets);
-        this.device.queue.writeBuffer(this.cellCountsBuf, 0, counts);
-        this.device.queue.writeBuffer(this.scatterOffsetsBuf, 0, offsets.slice());
-
-        // 3. Scatter + Update + Render in one submission
-        const enc2 = this.device.createCommandEncoder();
-
-        // Scatter boids to sorted positions
-        {
-            const bg = this.device.createBindGroup({
-                layout: this.scatterPL.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: this.gridParamsBuf } },
-                    { binding: 1, resource: { buffer: this.posBuffers[src] } },
-                    { binding: 2, resource: { buffer: this.scatterOffsetsBuf } },
-                    { binding: 3, resource: { buffer: this.sortedIndicesBuf } },
-                ],
-            });
-            const pass = enc2.beginComputePass();
-            pass.setPipeline(this.scatterPL);
-            pass.setBindGroup(0, bg);
-            pass.dispatchWorkgroups(boidWg);
-            pass.end();
-        }
-
-        // Update boids
-        {
-            const bg = this.device.createBindGroup({
+        // Update boids bind groups (one per ping-pong direction)
+        this.updateBoidsBGs = [0, 1].map(src => {
+            const dst = 1 - src;
+            return this.device.createBindGroup({
                 layout: this.updateBoidsPL.getBindGroupLayout(0),
                 entries: [
                     { binding: 0, resource: { buffer: this.simParamsBuf } },
@@ -298,21 +246,115 @@ export class Simulation {
                     { binding: 7, resource: { buffer: this.cellCountsBuf } },
                 ],
             });
-            const pass = enc2.beginComputePass();
-            pass.setPipeline(this.updateBoidsPL);
-            pass.setBindGroup(0, bg);
+        });
+
+        // Render bind group (shared — doesn't depend on ping-pong)
+        this.renderBG = this.device.createBindGroup({
+            layout: this.renderPL.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: this.renderParamsBuf } }],
+        });
+    }
+
+    updateParams(params) {
+        Object.assign(this.simParams, params);
+    }
+
+    resize() {
+        this._resizeCanvas();
+        const old = this.numCells;
+        this._setupGrid();
+        if (this.numCells !== old) {
+            this.cellCountsBuf.destroy();
+            this.cellOffsetsBuf.destroy();
+            this.scatterOffsetsBuf.destroy();
+            this.cellCountsBuf = this.device.createBuffer({
+                size: this.numCells * 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            this.cellOffsetsBuf = this.device.createBuffer({
+                size: this.numCells * 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            });
+            this.scatterOffsetsBuf = this.device.createBuffer({
+                size: this.numCells * 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            });
+            // Rebuild all bind groups that reference grid buffers
+            this._createBindGroups();
+        }
+    }
+
+    frame(timestamp) {
+        this._frameCount++;
+        if (timestamp - this._lastTime >= 1000) {
+            this._fps = this._frameCount;
+            this._frameCount = 0;
+            this._lastTime = timestamp;
+            if (this.onFpsUpdate) this.onFpsUpdate(this._fps);
+        }
+
+        const src = this.t % 2;
+        const dst = (this.t + 1) % 2;
+        const boidWg = Math.ceil(this.NUM_BOIDS / this.WORKGROUP_SIZE);
+        const cellWg = Math.ceil(this.numCells / this.WORKGROUP_SIZE);
+
+        this._writeUniforms();
+
+        // Single command encoder for the entire frame — no GPU↔CPU sync!
+        const enc = this.device.createCommandEncoder();
+
+        // 1. Clear cell counts on GPU
+        {
+            const pass = enc.beginComputePass();
+            pass.setPipeline(this.clearBufferPL);
+            pass.setBindGroup(0, this.clearCellCountsBG);
+            pass.dispatchWorkgroups(cellWg);
+            pass.end();
+        }
+
+        // 2. Count boids per cell
+        {
+            const pass = enc.beginComputePass();
+            pass.setPipeline(this.countCellsPL);
+            pass.setBindGroup(0, this.countCellsBGs[src]);
             pass.dispatchWorkgroups(boidWg);
             pass.end();
         }
 
-        // Render
+        // 3. GPU prefix sum (replaces the CPU mapAsync bottleneck)
+        {
+            const pass = enc.beginComputePass();
+            pass.setPipeline(this.prefixSumPL);
+            pass.setBindGroup(0, this.prefixSumBG);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+        }
+
+        // 4. Copy offsets for scatter (scatter uses atomics so needs its own copy)
+        enc.copyBufferToBuffer(this.cellOffsetsBuf, 0, this.scatterOffsetsBuf, 0, this.numCells * 4);
+
+        // 5. Scatter boids to sorted positions
+        {
+            const pass = enc.beginComputePass();
+            pass.setPipeline(this.scatterPL);
+            pass.setBindGroup(0, this.scatterBGs[src]);
+            pass.dispatchWorkgroups(boidWg);
+            pass.end();
+        }
+
+        // 6. Update boids
+        {
+            const pass = enc.beginComputePass();
+            pass.setPipeline(this.updateBoidsPL);
+            pass.setBindGroup(0, this.updateBoidsBGs[src]);
+            pass.dispatchWorkgroups(boidWg);
+            pass.end();
+        }
+
+        // 7. Render
         {
             const textureView = this.context.getCurrentTexture().createView();
-            const renderBG = this.device.createBindGroup({
-                layout: this.renderPL.getBindGroupLayout(0),
-                entries: [{ binding: 0, resource: { buffer: this.renderParamsBuf } }],
-            });
-            const pass = enc2.beginRenderPass({
+            const pass = enc.beginRenderPass({
                 colorAttachments: [{
                     view: textureView,
                     clearValue: { r: 0.16, g: 0.16, b: 0.21, a: 1.0 }, // Dark blue-grey background
@@ -321,27 +363,27 @@ export class Simulation {
                 }],
             });
             pass.setPipeline(this.renderPL);
-            pass.setBindGroup(0, renderBG);
+            pass.setBindGroup(0, this.renderBG);
             pass.setVertexBuffer(0, this.posBuffers[dst]);
             pass.setVertexBuffer(1, this.velBuffers[dst]);
             pass.draw(3, this.NUM_BOIDS, 0, 0);
             pass.end();
         }
 
-        this.device.queue.submit([enc2.finish()]);
+        this.device.queue.submit([enc.finish()]);
         this.t++;
     }
 
     _writeUniforms() {
         const p = this.simParams;
 
-        const gp = new ArrayBuffer(16);
+        const gp = this._gridParamsAB;
         new Uint32Array(gp, 0, 2).set([this.gridSizeX, this.gridSizeY]);
         new Float32Array(gp, 8, 1).set([this.cellSize]);
         new Uint32Array(gp, 12, 1).set([this.NUM_BOIDS]);
         this.device.queue.writeBuffer(this.gridParamsBuf, 0, gp);
 
-        const sb = new ArrayBuffer(64);
+        const sb = this._simParamsAB;
         const sf = new Float32Array(sb);
         const su = new Uint32Array(sb);
         sf[0] = p.deltaT;
@@ -364,7 +406,16 @@ export class Simulation {
 
         // Extremely small boid size to look like dots (as in the target image)
         const boidSize = Math.max(0.2, 0.15 * (1000 / Math.sqrt(this.NUM_BOIDS)));
-        this.device.queue.writeBuffer(this.renderParamsBuf, 0,
-            new Float32Array([this.boundsX, this.boundsY, boidSize, 0]));
+        const rp = this._renderParamsF32;
+        rp[0] = this.boundsX; rp[1] = this.boundsY; rp[2] = boidSize; rp[3] = 0;
+        this.device.queue.writeBuffer(this.renderParamsBuf, 0, rp);
+
+        // Prefix sum params
+        this.device.queue.writeBuffer(this.prefixSumParamsBuf, 0,
+            new Uint32Array([this.numCells, 0, 0, 0]));
+
+        // Clear params (clear uses 0 fill, count = numCells)
+        this.device.queue.writeBuffer(this.clearParamsBuf, 0,
+            new Uint32Array([this.numCells, 0, 0, 0]));
     }
 }

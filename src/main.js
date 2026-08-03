@@ -20,8 +20,8 @@ async function main() {
     createUI(simulation);
     window.addEventListener('resize', () => simulation.resize());
 
-    async function loop(timestamp) {
-        await simulation.frame(timestamp);
+    function loop(timestamp) {
+        simulation.frame(timestamp);
         requestAnimationFrame(loop);
     }
 
